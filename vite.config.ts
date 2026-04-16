@@ -16,4 +16,20 @@ export default defineConfig({
       "@": path.resolve(__dirname, "src"),
     },
   },
+  server: {
+    // Écoute sur toutes les interfaces réseau → accessible par IP externe en dev
+    host: "0.0.0.0",
+    port: 5173,
+    proxy: {
+      // Toutes les requêtes /api/* sont redirigées vers le backend local
+      "/api": {
+        target: "http://localhost:4000",
+        changeOrigin: true,
+      },
+      "/health": {
+        target: "http://localhost:4000",
+        changeOrigin: true,
+      },
+    },
+  },
 });

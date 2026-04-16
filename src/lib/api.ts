@@ -1,7 +1,10 @@
+// URL relative vide = appels vers /api/... sur le même hôte que le frontend.
+// En dev, Vite proxy redirige vers http://localhost:4000.
+// En prod, Nginx proxy redirige vers le backend container.
 const apiBase = (
   (import.meta.env.VITE_API_URL as string | undefined) ||
   (import.meta.env.VITE_API_BASE_URL as string | undefined) ||
-  'http://localhost:4000'
+  ''
 ).replace(/\/$/, '');
 
 export const getApiBaseUrl = () => apiBase;

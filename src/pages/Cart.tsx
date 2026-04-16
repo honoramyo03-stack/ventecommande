@@ -62,10 +62,18 @@ const Cart: React.FC = () => {
     return products.find((product) => product.id === productId)?.quantity;
   };
 
-  // Obtenir UNIQUEMENT les commandes de ce client (nom + table)
-  const allMyOrders = customer 
+  // Obtenir UNIQUEMENT les commandes créées pendant cette session active
+  const allMyOrders = customer
     ? orders
-        .filter(o => o.customerName === customer.name && o.tableNumber === customer.tableNumber)
+        .filter((o) => {
+          // Vérifier que la commande appartient à cette table
+          if (o.tableNumber !== customer.tableNumber) return false;
+
+          // Vérifier que la commande a été créée après la connexion de cette session
+          const orderCreatedAt = new Date(o.createdAt);
+          const sessionStartedAt = new Date(customer.connectedAt);
+          return orderCreatedAt >= sessionStartedAt;
+        })
         .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
     : [];
 

@@ -36,7 +36,10 @@ const CustomerLogin: React.FC = () => {
 
   const isTableOccupiedBySameName = (tableNum: number, clientName: string) => {
     const occupant = connectedCustomers.find(c => c.tableNumber === tableNum);
-    return occupant && occupant.name.toLowerCase() === clientName.toLowerCase();
+    return (
+      occupant &&
+      occupant.name.trim().toLowerCase() === clientName.trim().toLowerCase()
+    );
   };
 
   const getTableNumber = (): number | null => {

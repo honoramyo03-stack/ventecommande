@@ -59,6 +59,16 @@ export interface Category {
   order: number;
 }
 
+export type ButtonActionType = 'reaction' | 'order_now' | 'view_promo' | 'custom';
+
+export interface AnnouncementReactionButton {
+  id: string;
+  label: string;
+  emoji?: string;
+  actionType?: ButtonActionType;
+  actionUrl?: string;
+}
+
 export interface RestaurantSettings {
   name: string;
   tableCount: number;
@@ -68,6 +78,27 @@ export interface RestaurantSettings {
   currency: string;
   phone: string;
   address: string;
+  announcementEnabled: boolean;
+  announcementText: string;
+  announcementImage: string;
+  announcementPublishedAt: string;
+  announcementRevision: string;
+  announcementReactionButtons: AnnouncementReactionButton[];
+  announcementReactionCounts: Record<string, number>;
+  announcementReactionsTotal: number;
+  announcementHistory: AnnouncementHistoryItem[];
+}
+
+export interface AnnouncementHistoryItem {
+  id: string;
+  revision: string;
+  text: string;
+  image: string;
+  buttons: AnnouncementReactionButton[];
+  publishedAt: string;
+  reactionsTotal: number;
+  reactionsByButton: Record<string, number>;
+  enabled: boolean;
 }
 
 interface OrdersContextType {
@@ -94,6 +125,7 @@ interface OrdersContextType {
   deleteCategory: (id: string) => void;
   restaurantSettings: RestaurantSettings;
   updateRestaurantSettings: (settings: Partial<RestaurantSettings>) => void;
+  publishAnnouncement: (settings: Partial<RestaurantSettings>) => void;
   isOnline: boolean;
   loading: boolean;
 }
@@ -115,15 +147,72 @@ const defaultSettings: RestaurantSettings = {
   currency: 'Ar',
   phone: '',
   address: '',
+  announcementEnabled: false,
+  announcementText: '',
+  announcementImage: '',
+  announcementPublishedAt: '',
+  announcementRevision: '',
+  announcementReactionButtons: [],
+  announcementReactionCounts: {},
+  announcementReactionsTotal: 0,
+  announcementHistory: [],
+};
+
+const normalizeReactionButtons = (value: any): AnnouncementReactionButton[] => {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((button) => ({
+      id: String(button?.id || '').trim(),
+      label: String(button?.label || '').trim(),
+      emoji: String(button?.emoji || '').trim() || undefined,
+    }))
+    .filter((button) => button.id && button.label);
+};
+
+const normalizeReactionCounts = (value: any): Record<string, number> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+
+  return Object.entries(value).reduce<Record<string, number>>((acc, [key, count]) => {
+    acc[key] = Number(count) || 0;
+    return acc;
+  }, {});
+};
+
+const normalizeProvider = (value: any): PaymentMethod => {
+  if (!value) {
+    console.warn('Provider undefined, fallback utilisé');
+    return 'orange_money';
+  }
+
+  switch (value) {
+    case 'orange':
+    case 'orange_money':
+    case 'Orange Money':
+      return 'orange_money';
+
+    case 'mvola':
+    case 'Mvola':
+      return 'mvola';
+
+    case 'airtel':
+    case 'airtel_money':
+    case 'Airtel Money':
+      return 'airtel_money';
+
+    default:
+      console.warn('Unknown provider:', value);
+      return 'orange_money';
+  }
 };
 
 const mapOrder = (row: any): Order => ({
   id: row.id,
   tableNumber: row.table_number,
-  items: row.items || [],
+  items: row.items || (row.items_json ? JSON.parse(row.items_json) : []),
   total: Number(row.total || 0),
   status: row.status,
-  paymentMethod: row.payment_method,
+  paymentMethod: normalizeProvider(row.payment_method),
   createdAt: new Date(row.created_at),
   paidAt: row.paid_at ? new Date(row.paid_at) : undefined,
   validatedAt: row.validated_at ? new Date(row.validated_at) : undefined,
@@ -211,6 +300,14 @@ export const OrdersProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       currency: row.currency,
       phone: row.phone || '',
       address: row.address || '',
+      announcementEnabled: Number(row.announcement_enabled) === 1,
+      announcementText: row.announcement_text || '',
+      announcementImage: row.announcement_image || '',
+      announcementPublishedAt: row.announcement_published_at || '',
+      announcementRevision: row.announcement_revision || '',
+      announcementReactionButtons: normalizeReactionButtons(row.announcement_reaction_buttons),
+      announcementReactionCounts: normalizeReactionCounts(row.announcement_reaction_counts),
+      announcementReactionsTotal: Number(row.announcement_reactions_total) || 0,
     });
   }, []);
 
@@ -264,14 +361,15 @@ export const OrdersProvider: React.FC<{ children: ReactNode }> = ({ children }) 
   }, [loadCategories, loadOrders, loadPaymentNumbers, loadProducts, loadSellerAccounts, loadSettings, syncAll]);
 
   const addOrder = async (orderData: Omit<Order, 'id' | 'createdAt' | 'status'>): Promise<Order> => {
+    const normalizedClientName = orderData.customerName?.trim() || null;
     const row = await apiRequest<any>('/api/orders', {
       method: 'POST',
       body: {
         tableNumber: orderData.tableNumber,
-        clientName: orderData.customerName,
+        clientName: normalizedClientName,
         items: orderData.items,
         total: orderData.total,
-        paymentMethod: orderData.paymentMethod,
+        paymentMethod: orderData.paymentMethod ?? 'orange_money',
         notes: orderData.notes,
         estimatedMinutes: orderData.estimatedMinutes ?? restaurantSettings.defaultPrepTime,
       },
@@ -374,7 +472,7 @@ export const OrdersProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     await loadCategories();
   };
 
-  const updateRestaurantSettings = async (settings: Partial<RestaurantSettings>) => {
+  const updateRestaurantSettings = useCallback(async (settings: Partial<RestaurantSettings>) => {
     await apiRequest('/api/settings', {
       method: 'PATCH',
       body: {
@@ -386,10 +484,36 @@ export const OrdersProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         currency: settings.currency,
         phone: settings.phone,
         address: settings.address,
+        announcement_enabled: settings.announcementEnabled !== undefined ? (settings.announcementEnabled ? 1 : 0) : undefined,
+        announcement_text: settings.announcementText,
+        announcement_image: settings.announcementImage,
+        announcement_reaction_buttons: settings.announcementReactionButtons,
       },
     });
     await loadSettings();
-  };
+  }, [loadSettings]);
+
+  const publishAnnouncement = useCallback(async (settings: Partial<RestaurantSettings>) => {
+    await apiRequest('/api/settings', {
+      method: 'PATCH',
+      body: {
+        name: settings.name,
+        table_count: settings.tableCount,
+        logo: settings.logo,
+        vat_rate: settings.vatRate,
+        default_prep_time: settings.defaultPrepTime,
+        currency: settings.currency,
+        phone: settings.phone,
+        address: settings.address,
+        announcement_enabled: 1,
+        announcement_text: settings.announcementText,
+        announcement_image: settings.announcementImage,
+        announcement_reaction_buttons: settings.announcementReactionButtons,
+        announcement_publish_now: true,
+      },
+    });
+    await loadSettings();
+  }, [loadSettings]);
 
   const value = useMemo<OrdersContextType>(
     () => ({
@@ -416,10 +540,11 @@ export const OrdersProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       deleteCategory,
       restaurantSettings,
       updateRestaurantSettings,
+      publishAnnouncement,
       isOnline,
       loading,
     }),
-    [orders, products, paymentNumbers, sellerAccounts, categories, restaurantSettings, isOnline, loading]
+    [orders, products, paymentNumbers, sellerAccounts, categories, restaurantSettings, updateRestaurantSettings, publishAnnouncement, isOnline, loading]
   );
 
   return <OrdersContext.Provider value={value}>{children}</OrdersContext.Provider>;

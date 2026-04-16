@@ -109,24 +109,43 @@ const ChatWidget: React.FC = () => {
     let replyToContent: string | undefined;
     let replyToSenderName: string | undefined;
 
+    // Déterminer le destinataire basé sur le contexte de réponse
+    let targetRecipientType: 'seller' | 'client' | undefined;
+    let targetRecipientTable: number | undefined;
+
     if (replyToId) {
       const originalMsg = messages.find(m => m.id === replyToId);
       if (originalMsg) {
         replyToContent = originalMsg.message;
         replyToSenderName = originalMsg.senderName || (originalMsg.senderType === 'seller' ? 'Vendeur' : 'Client');
+
+        // Logique de réponse : répondre à l'envoyeur du message original
+        if (originalMsg.senderType === 'seller') {
+          // Réponse à un message du vendeur -> va au vendeur
+          targetRecipientType = 'seller';
+          targetRecipientTable = undefined;
+        } else if (originalMsg.senderType === 'client') {
+          // Réponse à un message d'un client -> va à ce client
+          targetRecipientType = 'client';
+          targetRecipientTable = originalMsg.tableNumber;
+        }
       }
+    } else {
+      // Message normal (pas une réponse) : utiliser les paramètres actuels
+      targetRecipientType = recipientType;
+      targetRecipientTable = selectedRecipientTable ? parseInt(selectedRecipientTable) : undefined;
     }
 
     if (isSeller) {
-      if (!selectedRecipientTable) return false;
+      if (!targetRecipientTable && targetRecipientType === 'client') return false;
       try {
         await sendMessage(
           content,
           'seller',
           undefined,
           'Vendeur',
-          'client',
-          parseInt(selectedRecipientTable),
+          targetRecipientType,
+          targetRecipientTable,
           replyToId,
           replyToContent,
           replyToSenderName,
@@ -137,7 +156,7 @@ const ChatWidget: React.FC = () => {
         return false;
       }
     } else {
-      if (recipientType === 'seller') {
+      if (targetRecipientType === 'seller') {
         try {
           await sendMessage(
             content,
@@ -156,7 +175,7 @@ const ChatWidget: React.FC = () => {
           return false;
         }
       } else {
-        if (!selectedRecipientTable) return false;
+        if (!targetRecipientTable) return false;
         try {
           await sendMessage(
             content,
@@ -164,7 +183,7 @@ const ChatWidget: React.FC = () => {
             customer?.tableNumber,
             customer?.name,
             'client',
-            parseInt(selectedRecipientTable),
+            targetRecipientTable,
             replyToId,
             replyToContent,
             replyToSenderName,

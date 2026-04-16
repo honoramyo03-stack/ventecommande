@@ -1,40 +1,36 @@
 @echo off
+setlocal
+title QuickOrder - Developpement
+echo.
 echo ============================================
-echo   QuickOrder - Demarrage Developpement
-echo ============================================
-echo.
-
-echo [1/5] Installation des dependances backend...
-cd backend
-call npm install
-echo.
-
-echo [2/5] Creation de la base de donnees SQLite...
-node db_setup.js
-echo.
-
-echo [3/5] Demarrage du backend (port 4000)...
-start "QuickOrder Backend" cmd /k "node src/server.js"
-echo    Backend demarre sur http://localhost:4000
-echo.
-
-echo [4/5] Attente du backend (3 secondes)...
-timeout /t 3 /nobreak >nul
-
-cd ..
-
-echo [5/5] Demarrage du frontend (port 5173)...
-start "QuickOrder Frontend" cmd /k "npm run dev -- --host"
-echo    Frontend demarre sur http://localhost:5173
-echo.
-
-echo ============================================
-echo   Backend:  http://localhost:4000/api
-echo   Frontend: http://localhost:5173
-echo   Vendeur:  admin / password
+echo   QuickOrder - Mode Developpement
 echo ============================================
 echo.
-echo Les deux serveurs sont demarres dans des fenetres separees.
-echo Fermez les fenetres pour arreter les serveurs.
+
+where node >nul 2>&1 || (echo [ERREUR] Node.js non trouve. Installez-le depuis nodejs.org && pause && exit /b 1)
+
+echo [1/4] Installation des dependances...
+if not exist "node_modules" ( call npm install )
+if not exist "backend\node_modules" ( cd backend && call npm install && cd .. )
+
+echo [2/4] Demarrage du backend (port 4000)...
+start "QuickOrder Backend" cmd /k "cd /d %~dp0backend && node src/server.js"
+
+echo [3/4] Attente du backend (4 secondes)...
+timeout /t 4 /nobreak >nul
+
+echo [4/4] Demarrage du frontend (port 5173)...
+start "QuickOrder Frontend" cmd /k "cd /d %~dp0 && npm run dev"
+
 echo.
+echo ============================================
+echo   Frontend : http://localhost:5173
+echo   Backend  : http://localhost:4000/api
+echo   Vendeur  : admin / password
+echo.
+echo   Acces LAN : http://<votre-IP>:5173
+echo   (IP : ipconfig dans le terminal)
+echo ============================================
+echo.
+echo Fermez les deux fenetres pour arreter.
 pause

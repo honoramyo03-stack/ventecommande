@@ -1,8 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Package, PlusCircle, CreditCard, UserPlus, Save, X, Edit2, Trash2, FileText, Download, Search, Wallet, User, Settings, BarChart3, Clock, TrendingUp, Award, Sun, Moon, Printer, Upload, Eye, Tag, ChevronRight, CheckCircle, AlertCircle, DollarSign, ShoppingBag, Users, Zap, CalendarDays } from 'lucide-react';
-import { useOrders, OrderStatus, Order } from '../contexts/OrdersContext';
+import { Package, PlusCircle, CreditCard, UserPlus, Save, X, Edit2, Trash2, FileText, Download, Search, Wallet, User, Settings, BarChart3, Clock, TrendingUp, Award, Sun, Moon, Printer, Upload, Eye, Tag, ChevronRight, CheckCircle, AlertCircle, DollarSign, ShoppingBag, Users, Zap, CalendarDays, Bell } from 'lucide-react';
+import { useOrders, OrderStatus, Order, AnnouncementReactionButton } from '../contexts/OrdersContext';
 import { useCustomer } from '../contexts/CustomerContext';
+import { confirmPaymentVendor, rejectPaymentVendor, listPayments } from '../lib/paymentApi';
+import type { PaymentTransaction } from '../lib/paymentApi';
 import SellerHeader from '../components/SellerHeader';
 import { useNotification } from '../contexts/NotificationContext';
 
@@ -66,20 +68,50 @@ type AutoReportSchedule = {
 
 const reportPeriods = ['journalier', 'hebdomadaire', 'mensuel', 'trimestriel'] as const;
 
+type SellerTab = 'orders' | 'products' | 'payments' | 'accounts' | 'reports' | 'stats' | 'categories' | 'publication' | 'settings';
+
+const stripAnnouncementHtml = (html: string) =>
+  html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .trim();
+
+const hasAnnouncementTextContent = (html: string) => stripAnnouncementHtml(html).length > 0;
+
+const hasAnnouncementContent = (text: string, image: string, buttons: AnnouncementReactionButton[] = []) =>
+  hasAnnouncementTextContent(text) || image.trim().length > 0 || buttons.length > 0;
+
+const formatAnnouncementDate = (value?: string) => {
+  if (!value) return 'Pas encore publiee';
+
+  try {
+    return new Intl.DateTimeFormat('fr-FR', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(new Date(value));
+  } catch {
+    return value;
+  }
+};
+
 const SellerDashboard: React.FC = () => {
   const navigate = useNavigate();
   const {
     orders, updateOrderStatus, products, addProduct, updateProduct, deleteProduct,
     paymentNumbers, updatePaymentNumber, sellerAccounts, addSellerAccount, updateSellerAccount, deleteSellerAccount,
     categories, addCategory, updateCategory, deleteCategory,
-    restaurantSettings, updateRestaurantSettings,
+    restaurantSettings, updateRestaurantSettings, publishAnnouncement,
   } = useOrders();
   const { connectedCustomers } = useCustomer();
   const { notify } = useNotification();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const productFileRef = useRef<HTMLInputElement>(null);
+  const announcementImageFileRef = useRef<HTMLInputElement>(null);
+  const announcementEditorRef = useRef<HTMLDivElement>(null);
 
-  const [activeTab, setActiveTab] = useState<'orders' | 'products' | 'payments' | 'accounts' | 'reports' | 'stats' | 'categories' | 'settings'>('orders');
+  const [activeTab, setActiveTab] = useState<SellerTab>('orders');
   const [selectedStatus, setSelectedStatus] = useState<OrderStatus | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [productFilter, setProductFilter] = useState('');
@@ -95,6 +127,14 @@ const SellerDashboard: React.FC = () => {
   const [editingProduct, setEditingProduct] = useState<any>(null);
   const [editingCategory, setEditingCategory] = useState<any>(null);
   const [editingPayment, setEditingPayment] = useState<string | null>(null);
+  // Local drafts pour les formulaires (évite les appels API à chaque frappe)
+  const [paymentDraft, setPaymentDraft] = useState<Record<string, { number: string; merchantName: string }>>({});
+  const [settingsDraft, setSettingsDraft] = useState<typeof restaurantSettings | null>(null);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [savingPayment, setSavingPayment] = useState<string | null>(null);
+  // Paiements en attente de confirmation vendeur
+  const [pendingPayments, setPendingPayments] = useState<PaymentTransaction[]>([]);
+  const [confirmingPayment, setConfirmingPayment] = useState<string | null>(null);
   const [reportHistory, setReportHistory] = useState<ReportHistoryItem[]>(() => {
     try {
       const raw = localStorage.getItem('seller_report_history');
@@ -319,6 +359,229 @@ const SellerDashboard: React.FC = () => {
     }
   };
 
+  /* ─── Charger les transactions en attente ─────────────────── */
+  const loadPendingPayments = useCallback(async () => {
+    try {
+      const all = await listPayments();
+      setPendingPayments(all.filter((t) => t.status === 'pending'));
+    } catch { /* silencieux si hors-ligne */ }
+  }, []);
+
+  useEffect(() => {
+    loadPendingPayments();
+  }, [loadPendingPayments, orders]); // se rafraîchit quand les orders changent (SSE)
+
+  /* ─── Vendeur : confirmer un paiement ─────────────────────── */
+  const handleConfirmPayment = async (txn: PaymentTransaction) => {
+    setConfirmingPayment(txn.id);
+    try {
+      await confirmPaymentVendor(txn.id);
+      notify(`✅ Paiement ${txn.external_reference} confirmé — Commande Table ${txn.table_number}`, 'success');
+      await loadPendingPayments();
+    } catch (e) {
+      notify('Erreur lors de la confirmation', 'error');
+    } finally {
+      setConfirmingPayment(null);
+    }
+  };
+
+  const handleRejectPayment = async (txn: PaymentTransaction) => {
+    setConfirmingPayment(txn.id);
+    try {
+      await rejectPaymentVendor(txn.id);
+      notify(`Paiement ${txn.external_reference} rejeté`, 'warning');
+      await loadPendingPayments();
+    } catch {
+      notify('Erreur lors du rejet', 'error');
+    } finally {
+      setConfirmingPayment(null);
+    }
+  };
+
+  /* ─── Settings : draft local + save ──────────────────────── */
+  const openSettingsDraft = () => setSettingsDraft({ ...restaurantSettings });
+  const handleSaveSettings = async () => {
+    if (!settingsDraft) return;
+    setSavingSettings(true);
+    try {
+      await updateRestaurantSettings(settingsDraft);
+      setSettingsDraft(null);
+      notify('✅ Paramètres enregistrés', 'success');
+    } catch {
+      notify('Erreur lors de la sauvegarde', 'error');
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const setAnnouncementDraft = useCallback((patch: Partial<typeof restaurantSettings>) => {
+    setSettingsDraft((prev) => ({ ...(prev ?? restaurantSettings), ...patch }));
+  }, [restaurantSettings]);
+
+  const focusAnnouncementEditor = () => {
+    window.requestAnimationFrame(() => announcementEditorRef.current?.focus());
+  };
+
+  const handleClearAnnouncement = () => {
+    setAnnouncementDraft({
+      announcementEnabled: false,
+      announcementText: '',
+      announcementImage: '',
+      announcementReactionButtons: [],
+    });
+    setAnnouncementReactionLabel('');
+    setAnnouncementReactionEmoji('');
+
+    const editor = announcementEditorRef.current;
+    if (editor) {
+      editor.innerHTML = '';
+    }
+  };
+
+  const handleAddReactionButton = () => {
+    const label = announcementReactionLabel.trim();
+    const emoji = announcementReactionEmoji.trim();
+    if (!label) {
+      notify('Ajoutez un libelle pour le bouton de reaction', 'warning');
+      return;
+    }
+
+    const currentButtons = (settingsDraft ?? restaurantSettings).announcementReactionButtons;
+    if (currentButtons.length >= 6) {
+      notify('Maximum 6 boutons de reaction par publication', 'warning');
+      return;
+    }
+
+    setAnnouncementDraft({
+      announcementReactionButtons: [
+        ...currentButtons,
+        {
+          id: `reaction-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          label,
+          emoji: emoji || undefined,
+        },
+      ],
+    });
+    setAnnouncementReactionLabel('');
+    setAnnouncementReactionEmoji('');
+  };
+
+  const handleRemoveReactionButton = (buttonId: string) => {
+    const currentButtons = (settingsDraft ?? restaurantSettings).announcementReactionButtons;
+    setAnnouncementDraft({
+      announcementReactionButtons: currentButtons.filter((button) => button.id !== buttonId),
+    });
+  };
+
+  const handlePublishAnnouncement = async () => {
+    const draft = settingsDraft ?? restaurantSettings;
+    if (!hasAnnouncementContent(draft.announcementText, draft.announcementImage, draft.announcementReactionButtons)) {
+      notify('Ajoutez un message, une image ou un bouton de reaction avant de publier', 'warning');
+      return;
+    }
+
+    setSavingSettings(true);
+    try {
+      await publishAnnouncement(draft);
+      setSettingsDraft(null);
+      notify('✅ Publication mise en ligne', 'success');
+    } catch {
+      notify('Erreur lors de la publication', 'error');
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const [announcementColor, setAnnouncementColor] = useState('#0f172a');
+  const [announcementBgColor, setAnnouncementBgColor] = useState('#ffffff');
+  const [announcementSize, setAnnouncementSize] = useState('20');
+  const [announcementFont, setAnnouncementFont] = useState('serif');
+  const [announcementReactionLabel, setAnnouncementReactionLabel] = useState('');
+  const [announcementReactionEmoji, setAnnouncementReactionEmoji] = useState('');
+
+  // Initialiser le contenu de l'éditeur une seule fois au chargement
+  useEffect(() => {
+    const editor = announcementEditorRef.current;
+    if (!editor || editor.innerHTML.trim()) return;
+    const initialContent = settingsDraft?.announcementText || restaurantSettings.announcementText || '';
+    if (initialContent) {
+      editor.innerHTML = initialContent;
+    }
+  }, []);
+
+  // Réinitialiser quand on change de draft
+  useEffect(() => {
+    const editor = announcementEditorRef.current;
+    if (!editor) return;
+    const newContent = settingsDraft?.announcementText || restaurantSettings.announcementText || '';
+    if (editor.innerHTML !== newContent && !editor.contains(document.activeElement)) {
+      editor.innerHTML = newContent;
+    }
+  }, [settingsDraft?.announcementText, restaurantSettings.announcementText]);
+
+  const updateAnnouncementHtml = () => {
+    const editor = announcementEditorRef.current;
+    if (!editor) return;
+    const html = editor.innerHTML;
+    setAnnouncementDraft({ announcementText: hasAnnouncementTextContent(html) ? html : '' });
+  };
+
+  const applyAnnouncementFormat = (command: string, value?: string) => {
+    const editor = announcementEditorRef.current;
+    if (!editor) return;
+    editor.focus();
+    document.execCommand(command, false, value || undefined);
+    // Relancer la mise à jour après un petit délai pour laisser le DOM se stabiliser
+    setTimeout(() => updateAnnouncementHtml(), 10);
+  };
+
+  const wrapSelectionWithSpan = (style: string) => {
+    const editor = announcementEditorRef.current;
+    if (!editor) return;
+    editor.focus();
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return;
+    const range = selection.getRangeAt(0);
+    if (range.collapsed) {
+      const span = document.createElement('span');
+      span.setAttribute('style', style);
+      span.textContent = 'Texte';
+      range.insertNode(span);
+    } else {
+      const span = document.createElement('span');
+      span.setAttribute('style', style);
+      span.textContent = range.toString();
+      range.deleteContents();
+      range.insertNode(span);
+      selection.removeAllRanges();
+      const newRange = document.createRange();
+      newRange.selectNodeContents(span);
+      selection.addRange(newRange);
+    }
+    // Relancer la mise à jour après un petit délai
+    setTimeout(() => updateAnnouncementHtml(), 10);
+  };
+
+  /* ─── Payment numbers : draft local + save ──────────────── */
+  const openPaymentDraft = (key: string, info: { number: string; merchantName: string }) => {
+    setPaymentDraft((d) => ({ ...d, [key]: { ...info } }));
+    setEditingPayment(key);
+  };
+  const handleSavePayment = async (key: string) => {
+    const draft = paymentDraft[key];
+    if (!draft) return;
+    setSavingPayment(key);
+    try {
+      await updatePaymentNumber(key as any, draft);
+      setEditingPayment(null);
+      notify(`✅ ${key === 'orange_money' ? 'Orange Money' : key === 'mvola' ? 'Mvola' : 'Airtel Money'} mis à jour`, 'success');
+    } catch {
+      notify('Erreur lors de la sauvegarde', 'error');
+    } finally {
+      setSavingPayment(null);
+    }
+  };
+
   // Get estimated time remaining
   const getEstimatedTimeRemaining = (order: Order) => {
     if (!order.estimatedMinutes) return null;
@@ -491,6 +754,7 @@ const SellerDashboard: React.FC = () => {
     { id: 'orders' as const, label: 'Commandes', icon: Package, badge: pendingOrders },
     { id: 'products' as const, label: 'Produits', icon: Package },
     { id: 'categories' as const, label: 'Catégories', icon: Tag },
+    { id: 'publication' as const, label: 'Publication', icon: Bell },
     { id: 'stats' as const, label: 'Statistiques', icon: BarChart3 },
     { id: 'payments' as const, label: 'Paiements', icon: CreditCard },
     { id: 'accounts' as const, label: 'Comptes', icon: User },
@@ -585,13 +849,39 @@ const SellerDashboard: React.FC = () => {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {filteredOrders.map(order => {
-                const nextStatus: Record<string, string> = { pending: 'Payé', paid: 'Préparer', preparing: 'Prêt', ready: 'Terminer' };
-                const canValidate = !!nextStatus[order.status];
+                const nextStatusMap: Record<string, string> = { pending: 'Payé', paid: 'Préparer', preparing: 'Prêt', ready: 'Terminer' };
+                const nextStatusLabel: Record<string, string> = { pending: 'Confirmer commande', paid: 'Lancer préparation', preparing: 'Marquer prêt', ready: 'Terminer commande' };
+                const nextStatusIcon: Record<string, string> = { pending: '✅', paid: '🍳', preparing: '🔔', ready: '🏁' };
+                const nextStatusColor: Record<string, string> = {
+                  pending:   'bg-blue-600   hover:bg-blue-700   text-white',
+                  paid:      'bg-orange-500 hover:bg-orange-600 text-white',
+                  preparing: 'bg-emerald-500 hover:bg-emerald-600 text-white',
+                  ready:     'bg-green-600  hover:bg-green-700  text-white',
+                };
+                const canValidate = !!nextStatusMap[order.status];
                 const isLocked = order.status === 'completed' || order.status === 'cancelled';
+                // Trouver une transaction mobile money en attente liée à cette commande
+                const pendingTxn = pendingPayments.find(t => t.order_id === order.id);
                 const compactItems = order.items?.slice(0, 2) || [];
                 const hiddenCount = (order.items?.length || 0) - compactItems.length;
+                const payMethod = order.paymentMethod;
+                const providerLabel = payMethod === 'orange_money' ? 'Orange' : payMethod === 'mvola' ? 'Mvola' : payMethod === 'airtel_money' ? 'Airtel' : null;
+
                 return (
-                  <div key={order.id} className={`${cardBg} border rounded-2xl p-4 shadow-sm ${isLocked ? 'opacity-85' : ''}`}>
+                  <div key={order.id} className={`${cardBg} border-2 rounded-2xl p-4 shadow-sm transition-all ${
+                    pendingTxn ? 'border-yellow-400' : isLocked ? 'border-transparent opacity-85' : 'border-transparent'
+                  }`}>
+                    {/* Badge paiement en attente */}
+                    {pendingTxn && (
+                      <div className="flex items-center gap-2 mb-3 bg-yellow-50 border border-yellow-300 rounded-xl px-3 py-2">
+                        <Bell size={14} className="text-yellow-600 animate-pulse shrink-0" />
+                        <span className="text-xs font-bold text-yellow-800 flex-1">
+                          Paiement {providerLabel} en attente de confirmation
+                          {pendingTxn.customer_phone && <span className="font-normal"> — {pendingTxn.customer_phone}</span>}
+                        </span>
+                      </div>
+                    )}
+
                     {/* Header */}
                     <div className="flex items-start justify-between gap-3 mb-3">
                       <div className="flex items-start gap-3 min-w-0">
@@ -601,25 +891,17 @@ const SellerDashboard: React.FC = () => {
                           <p className={`text-xs ${textSec}`}>{new Date(order.createdAt).toLocaleString('fr-FR')}</p>
                         </div>
                       </div>
-
                       <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => printReceipt(order)}
-                          className="p-2 rounded-xl transition-colors bg-gray-100 hover:bg-gray-200"
-                          title="Imprimer"
-                        >
+                        <button onClick={() => printReceipt(order)} className="p-2 rounded-xl bg-gray-100 hover:bg-gray-200 transition-colors" title="Imprimer">
                           <Printer size={16} />
                         </button>
-                        <button
-                          onClick={() => navigate(`/seller/orders/${order.id}`)}
-                          className="p-2 rounded-xl transition-colors bg-indigo-100 hover:bg-indigo-200 text-indigo-700"
-                        >
+                        <button onClick={() => navigate(`/seller/orders/${order.id}`)} className="p-2 rounded-xl bg-indigo-100 hover:bg-indigo-200 text-indigo-700 transition-colors">
                           <Eye size={16} />
                         </button>
                       </div>
                     </div>
 
-                    {/* Items summary (compact) */}
+                    {/* Articles */}
                     <div className={`text-sm ${textSec} mb-3 space-y-1`}>
                       {compactItems.map((i: any, idx: number) => {
                         const itemName = i.product?.name || i.name;
@@ -631,42 +913,72 @@ const SellerDashboard: React.FC = () => {
                           </p>
                         );
                       })}
-                      {hiddenCount > 0 ? <p className="text-xs font-semibold text-indigo-600">+{hiddenCount} article(s)</p> : null}
+                      {hiddenCount > 0 && <p className="text-xs font-semibold text-indigo-600">+{hiddenCount} article(s)</p>}
                     </div>
 
-                    {/* Status + Price + Validate */}
-                    <div className="flex items-center justify-between flex-wrap gap-2">
-                      <div className="flex items-center gap-3">
+                    {/* Statut + Prix */}
+                    <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className={`text-xs font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5 ${statusColor[order.status] || 'bg-gray-100 text-gray-700'}`}>
                           {statusIcon[order.status]}
                           {statusLabel[order.status] || order.status}
                         </span>
-                        <span className="text-lg font-bold">{formatPrice(order.total)}</span>
+                        {providerLabel && (
+                          <span className={`text-xs font-bold px-2 py-1 rounded-lg ${
+                            order.paymentStatus === 'paid' ? 'bg-green-100 text-green-700' :
+                            order.paymentStatus === 'pending' ? 'bg-yellow-100 text-yellow-700' :
+                            'bg-gray-100 text-gray-500'
+                          }`}>
+                            📱 {providerLabel} {order.paymentStatus === 'paid' ? '✓' : order.paymentStatus === 'pending' ? '⏳' : ''}
+                          </span>
+                        )}
                       </div>
-                      <div className="text-xs px-3 py-2 rounded-xl border bg-gray-50 text-gray-600 font-semibold">
-                        Statut fixe
-                      </div>
+                      <span className="text-lg font-bold">{formatPrice(order.total)}</span>
                     </div>
 
-                    {/* Validate button */}
-                    {canValidate && !isLocked && (
-                      <button onClick={() => validateOrder(order)}
-                        className={`mt-3 w-full py-3 rounded-xl text-base font-bold flex items-center justify-center gap-2 transition-all shadow-sm ${
-                          order.status === 'pending' ? 'bg-blue-600 hover:bg-blue-700 text-white' :
-                          order.status === 'paid' ? 'bg-orange-500 hover:bg-orange-600 text-white' :
-                          order.status === 'preparing' ? 'bg-emerald-500 hover:bg-emerald-600 text-white' :
-                          'bg-green-600 hover:bg-green-700 text-white'
-                        }`}>
-                        <CheckCircle size={18} />
-                        Valider → {nextStatus[order.status]}
-                      </button>
-                    )}
+                    {/* Boutons d'action */}
+                    <div className="space-y-2">
+                      {/* Confirmation paiement mobile money (priorité) */}
+                      {pendingTxn && (
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleConfirmPayment(pendingTxn)}
+                            disabled={confirmingPayment === pendingTxn.id}
+                            className="flex-1 py-3 bg-green-600 hover:bg-green-700 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 disabled:opacity-60 transition-colors shadow-sm"
+                          >
+                            {confirmingPayment === pendingTxn.id
+                              ? <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
+                              : <CheckCircle size={16} />}
+                            Confirmer paiement reçu
+                          </button>
+                          <button
+                            onClick={() => handleRejectPayment(pendingTxn)}
+                            disabled={confirmingPayment === pendingTxn.id}
+                            className="px-4 py-3 bg-red-50 hover:bg-red-100 text-red-600 rounded-xl font-bold text-sm flex items-center justify-center gap-1.5 disabled:opacity-60 transition-colors"
+                          >
+                            <X size={15} /> Rejeter
+                          </button>
+                        </div>
+                      )}
 
-                    {isLocked && (
-                      <div className="mt-3 w-full py-2.5 rounded-xl bg-gray-100 text-gray-600 text-sm font-semibold text-center">
-                        Commande verrouillee: aucune modification possible
-                      </div>
-                    )}
+                      {/* Bouton avancement statut commande */}
+                      {canValidate && !isLocked && (
+                        <button
+                          onClick={() => validateOrder(order)}
+                          className={`w-full py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-sm ${nextStatusColor[order.status]}`}
+                        >
+                          <span>{nextStatusIcon[order.status]}</span>
+                          {nextStatusLabel[order.status]}
+                          <ChevronRight size={16} />
+                        </button>
+                      )}
+
+                      {isLocked && (
+                        <div className="py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 text-gray-500 text-xs font-semibold text-center">
+                          {order.status === 'completed' ? '✅ Commande terminée' : '🚫 Commande annulée'}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 );
               })}
@@ -876,44 +1188,155 @@ const SellerDashboard: React.FC = () => {
 
         {/* ========== PAYMENTS TAB ========== */}
         {activeTab === 'payments' && (
-          <div className="flex flex-nowrap gap-4 overflow-x-auto no-scrollbar pb-1">
-            {Object.entries(paymentNumbers).map(([key, info]) => {
-              const provider = key === 'orange_money' ? 'Orange Money' : key === 'mvola' ? 'Mvola' : 'Airtel Money';
-              const color = key === 'orange_money' ? 'from-orange-500 to-orange-400' : key === 'mvola' ? 'from-red-600 to-red-500' : 'from-red-500 to-red-400';
-              const icon = key === 'orange_money' ? '🟠' : key === 'mvola' ? '🔴' : '🟣';
-              return (
-                <div key={key} className={`${cardBg} border rounded-2xl p-5 shadow-sm min-w-[320px] flex-1`}>
-                  <div className={`grid grid-cols-3 items-center gap-3 mb-3 text-sm`}>
-                    <div className={`bg-gradient-to-r ${color} text-white px-3 py-2 rounded-xl font-bold text-center`}>
-                      {icon} {provider}
-                    </div>
-                    <div className={`text-center ${textSec}`}>
-                      Marchand<br />
-                      <strong className={darkMode ? 'text-gray-100' : 'text-gray-900'}>{info.merchantName}</strong>
-                    </div>
-                    <div className="text-right font-mono font-bold text-lg">{info.number}</div>
+          <div className="space-y-6">
+
+            {/* ── Paiements en attente de confirmation vendeur ─── */}
+            {pendingPayments.length > 0 && (
+              <div className={`${cardBg} border-2 border-yellow-400 rounded-2xl p-5 shadow-md`}>
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="w-9 h-9 bg-yellow-100 rounded-full flex items-center justify-center">
+                    <Bell size={18} className="text-yellow-600 animate-pulse" />
                   </div>
-                  {editingPayment === key ? (
-                    <div className="space-y-3">
-                      <input type="text" value={info.number} onChange={e => updatePaymentNumber(key as any, { ...info, number: e.target.value })}
-                        className={inputCls} placeholder="Numéro" />
-                      <input type="text" value={info.merchantName} onChange={e => updatePaymentNumber(key as any, { ...info, merchantName: e.target.value })}
-                        className={inputCls} placeholder="Nom marchand" />
-                      <button onClick={() => { setEditingPayment(null); notify('Paiement mis à jour', 'info'); }}
-                        className="flex items-center gap-2 px-4 py-3 bg-green-600 text-white rounded-xl text-sm font-bold shadow-sm">
-                        <Save size={16} /> Enregistrer
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex justify-end">
-                      <button onClick={() => setEditingPayment(key)} className="p-2.5 rounded-xl bg-blue-50 text-blue-600 hover:bg-blue-100 transition-colors">
-                        <Edit2 size={18} />
-                      </button>
-                    </div>
-                  )}
+                  <div>
+                    <h3 className="font-bold text-base">Paiements en attente</h3>
+                    <p className={`text-xs ${textSec}`}>{pendingPayments.length} transfert{pendingPayments.length > 1 ? 's' : ''} à confirmer</p>
+                  </div>
                 </div>
-              );
-            })}
+                <div className="space-y-3">
+                  {pendingPayments.map((txn) => {
+                    const provLabel = txn.provider === 'orange_money' ? 'Orange Money' : txn.provider === 'mvola' ? 'Mvola' : 'Airtel Money';
+                    const provBg = txn.provider === 'orange_money' ? 'bg-orange-500' : txn.provider === 'mvola' ? 'bg-green-600' : 'bg-red-600';
+                    const isProcessing = confirmingPayment === txn.id;
+                    return (
+                      <div key={txn.id} className={`${darkMode ? 'bg-gray-700' : 'bg-gray-50'} rounded-xl p-4 flex flex-col sm:flex-row sm:items-center gap-3`}>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className={`text-xs text-white px-2 py-0.5 rounded-full font-bold ${provBg}`}>{provLabel}</span>
+                            <span className={`text-xs ${textSec} font-mono`}>{txn.external_reference}</span>
+                          </div>
+                          <p className="font-bold text-sm">Table {txn.table_number} — {txn.client_name}</p>
+                          <p className={`text-xs ${textSec}`}>
+                            {txn.customer_phone && <span>📱 {txn.customer_phone} · </span>}
+                            Montant : <strong>{new Intl.NumberFormat('fr-MG',{style:'currency',currency:'MGA',minimumFractionDigits:0}).format(txn.amount)}</strong>
+                          </p>
+                          <p className={`text-xs ${textSec} mt-0.5`}>{new Date(txn.created_at).toLocaleString('fr-FR')}</p>
+                        </div>
+                        <div className="flex gap-2 shrink-0">
+                          <button
+                            onClick={() => handleConfirmPayment(txn)}
+                            disabled={isProcessing}
+                            className="flex items-center gap-1.5 px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm font-bold disabled:opacity-60 transition-colors shadow-sm"
+                          >
+                            {isProcessing ? <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" /> : <CheckCircle size={16} />}
+                            Confirmer reçu
+                          </button>
+                          <button
+                            onClick={() => handleRejectPayment(txn)}
+                            disabled={isProcessing}
+                            className="flex items-center gap-1.5 px-3 py-2.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-xl text-sm font-bold disabled:opacity-60 transition-colors"
+                          >
+                            <X size={16} /> Rejeter
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {pendingPayments.length === 0 && (
+              <div className={`${cardBg} border rounded-2xl p-5 text-center ${textSec}`}>
+                <p className="text-2xl mb-2">✅</p>
+                <p className="font-semibold">Aucun paiement en attente</p>
+                <p className="text-xs mt-1">Les transferts mobile money apparaîtront ici</p>
+              </div>
+            )}
+
+            {/* ── Numéros de paiement par opérateur ──────────── */}
+            <div>
+              <h3 className="font-bold text-base mb-3">Numéros marchands</h3>
+              <div className="flex flex-nowrap gap-4 overflow-x-auto no-scrollbar pb-1">
+                {Object.entries(paymentNumbers).map(([key, info]) => {
+                  const provider = key === 'orange_money' ? 'Orange Money' : key === 'mvola' ? 'Mvola' : 'Airtel Money';
+                  const color = key === 'orange_money' ? 'from-orange-500 to-orange-400' : key === 'mvola' ? 'from-green-600 to-green-500' : 'from-red-600 to-red-500';
+                  const icon = key === 'orange_money' ? '🟠' : key === 'mvola' ? '🟢' : '🔴';
+                  const draft = paymentDraft[key] ?? info;
+                  const isEditing = editingPayment === key;
+                  const isSaving = savingPayment === key;
+                  return (
+                    <div key={key} className={`${cardBg} border rounded-2xl p-5 shadow-sm min-w-[320px] flex-1`}>
+                      {/* En-tête opérateur */}
+                      <div className="flex items-center gap-3 mb-4">
+                        <div className={`bg-gradient-to-r ${color} text-white px-4 py-2 rounded-xl font-bold text-sm flex items-center gap-1.5`}>
+                          {icon} {provider}
+                        </div>
+                        {!isEditing && (
+                          <button onClick={() => openPaymentDraft(key, info)} className="ml-auto p-2.5 rounded-xl bg-blue-50 text-blue-600 hover:bg-blue-100 transition-colors">
+                            <Edit2 size={18} />
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Affichage actuel */}
+                      {!isEditing && (
+                        <div className="space-y-2">
+                          <div className={`${darkMode ? 'bg-gray-700' : 'bg-gray-50'} rounded-xl p-3`}>
+                            <p className={`text-xs ${textSec} mb-0.5`}>Numéro marchand</p>
+                            <p className="font-mono font-bold text-xl tracking-widest">{info.number}</p>
+                          </div>
+                          <div className={`${darkMode ? 'bg-gray-700' : 'bg-gray-50'} rounded-xl p-3`}>
+                            <p className={`text-xs ${textSec} mb-0.5`}>Nom marchand</p>
+                            <p className="font-semibold">{info.merchantName}</p>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Formulaire d'édition avec état local */}
+                      {isEditing && (
+                        <div className="space-y-3">
+                          <div>
+                            <label className={`text-xs font-semibold ${textSec} block mb-1`}>Numéro marchand</label>
+                            <input
+                              type="tel"
+                              value={draft.number}
+                              onChange={e => setPaymentDraft(d => ({ ...d, [key]: { ...draft, number: e.target.value } }))}
+                              className={inputCls}
+                              placeholder="03X XXX XXXX"
+                            />
+                          </div>
+                          <div>
+                            <label className={`text-xs font-semibold ${textSec} block mb-1`}>Nom marchand</label>
+                            <input
+                              type="text"
+                              value={draft.merchantName}
+                              onChange={e => setPaymentDraft(d => ({ ...d, [key]: { ...draft, merchantName: e.target.value } }))}
+                              className={inputCls}
+                              placeholder="Nom affiché au client"
+                            />
+                          </div>
+                          <div className="flex gap-2 pt-1">
+                            <button
+                              onClick={() => handleSavePayment(key)}
+                              disabled={isSaving}
+                              className="flex-1 flex items-center justify-center gap-2 py-3 bg-green-600 hover:bg-green-700 text-white rounded-xl text-sm font-bold disabled:opacity-60 transition-colors shadow-sm"
+                            >
+                              {isSaving ? <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" /> : <Save size={16} />}
+                              Enregistrer
+                            </button>
+                            <button
+                              onClick={() => { setEditingPayment(null); setPaymentDraft(d => { const n = { ...d }; delete n[key]; return n; }); }}
+                              className={`px-4 py-3 rounded-xl text-sm font-bold ${darkMode ? 'bg-gray-600 hover:bg-gray-500' : 'bg-gray-100 hover:bg-gray-200'} transition-colors`}
+                            >
+                              Annuler
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         )}
 
@@ -1074,67 +1497,587 @@ const SellerDashboard: React.FC = () => {
           </div>
         )}
 
+        {/* ========== PUBLICATION TAB ========== */}
+        {activeTab === 'publication' && (() => {
+          const sd = settingsDraft ?? restaurantSettings;
+          const isDirty = settingsDraft !== null;
+          const setSD = (patch: Partial<typeof restaurantSettings>) =>
+            setSettingsDraft(prev => ({ ...(prev ?? restaurantSettings), ...patch }));
+          const draftHasContent = hasAnnouncementContent(sd.announcementText, sd.announcementImage, sd.announcementReactionButtons);
+          const liveHasContent = hasAnnouncementContent(
+            restaurantSettings.announcementText,
+            restaurantSettings.announcementImage,
+            restaurantSettings.announcementReactionButtons
+          );
+          const liveIsVisible = restaurantSettings.announcementEnabled && liveHasContent;
+          const livePublishedAt = formatAnnouncementDate(restaurantSettings.announcementPublishedAt);
+          const liveReactionButtons = restaurantSettings.announcementReactionButtons;
+          const liveReactionCounts = restaurantSettings.announcementReactionCounts;
+          const previewStatusClass = sd.announcementEnabled && draftHasContent
+            ? 'bg-emerald-100 text-emerald-800'
+            : draftHasContent
+              ? 'bg-amber-100 text-amber-800'
+              : 'bg-slate-100 text-slate-600';
+
+          return (
+            <div className="space-y-4">
+              {isDirty && (
+                <div className="sticky top-0 z-10 flex items-center justify-between gap-3 rounded-2xl bg-indigo-600 px-5 py-3 text-white shadow-lg">
+                  <p className="text-sm font-semibold">Publication modifiee - pensez a enregistrer pour l'envoyer au client.</p>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setSettingsDraft(null)}
+                      className="rounded-xl bg-white/20 px-4 py-2 text-sm font-bold transition-colors hover:bg-white/30"
+                    >
+                      Annuler
+                    </button>
+                    <button
+                      onClick={handleSaveSettings}
+                      disabled={savingSettings}
+                      className="flex items-center gap-2 rounded-xl bg-white px-4 py-2 text-sm font-bold text-indigo-700 shadow-sm transition-colors hover:bg-indigo-50 disabled:opacity-60"
+                    >
+                      {savingSettings
+                        ? <span className="h-4 w-4 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent" />
+                        : <Save size={15} />}
+                      Enregistrer
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className={`${cardBg} border rounded-2xl p-5 shadow-sm`}>
+                <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                  <div className="max-w-2xl">
+                    <p className="text-xs font-semibold uppercase tracking-[0.24em] text-indigo-500">Publication client</p>
+                    <h3 className="mt-2 text-2xl font-bold">Controle de diffusion</h3>
+                    <p className={`mt-2 text-sm ${textSec}`}>
+                      Cette publication apparait juste sous le message de bienvenue du client. Le contenu est visible cote client apres enregistrement et activation de la diffusion.
+                    </p>
+                    <div className="mt-3 flex flex-wrap items-center gap-3 text-xs font-medium text-slate-500">
+                      <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-3 py-1 text-slate-700">
+                        <CalendarDays size={13} /> Derniere publication : {livePublishedAt}
+                      </span>
+                      <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-3 py-1 text-indigo-700">
+                        <Bell size={13} /> {restaurantSettings.announcementReactionsTotal} reaction{restaurantSettings.announcementReactionsTotal > 1 ? 's' : ''}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    <span className={`inline-flex items-center rounded-full px-4 py-2 text-sm font-semibold ${previewStatusClass}`}>
+                      {sd.announcementEnabled && draftHasContent
+                        ? 'Diffusion active'
+                        : draftHasContent
+                          ? 'Brouillon hors ligne'
+                          : 'Aucune publication'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handlePublishAnnouncement}
+                      disabled={savingSettings || !draftHasContent}
+                      className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Publier maintenant
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!isDirty) openSettingsDraft();
+                        focusAnnouncementEditor();
+                      }}
+                      className={`rounded-xl px-4 py-2 text-sm font-semibold transition-colors ${
+                        darkMode
+                          ? 'bg-gray-700 text-gray-100 hover:bg-gray-600'
+                          : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      Modifier
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSD({ announcementEnabled: !sd.announcementEnabled })}
+                      className={`rounded-xl px-4 py-2 text-sm font-semibold text-white transition-colors ${
+                        sd.announcementEnabled ? 'bg-amber-500 hover:bg-amber-600' : 'bg-emerald-600 hover:bg-emerald-700'
+                      }`}
+                    >
+                      {sd.announcementEnabled ? 'Desactiver diffusion' : 'Activer diffusion'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleClearAnnouncement}
+                      disabled={!draftHasContent && !sd.announcementEnabled}
+                      className="rounded-xl bg-rose-100 px-4 py-2 text-sm font-semibold text-rose-700 transition-colors hover:bg-rose-200 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Supprimer
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-6 grid grid-cols-1 gap-4 xl:grid-cols-2">
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+                    <div className="mb-4 flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">Editeur</p>
+                        <p className="text-xs text-slate-500">Le panneau de droite se met a jour automatiquement.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={focusAnnouncementEditor}
+                        className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                      >
+                        Placer le curseur
+                      </button>
+                    </div>
+
+                    <label className="mb-4 flex items-center gap-3 text-sm font-semibold text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={sd.announcementEnabled}
+                        onChange={(e) => setSD({ announcementEnabled: e.target.checked })}
+                        className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                      />
+                      Diffuser cette publication aux clients
+                    </label>
+
+                    <div>
+                      <label className="mb-2 block text-sm font-semibold text-slate-700">Message de la publication</label>
+
+                      <div className="mb-2 flex flex-wrap items-center gap-1">
+                        <button type="button" onClick={() => applyAnnouncementFormat('bold')} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50">B</button>
+                        <button type="button" onClick={() => applyAnnouncementFormat('italic')} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm italic text-slate-700 hover:bg-slate-50">I</button>
+                        <button type="button" onClick={() => applyAnnouncementFormat('underline')} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm underline text-slate-700 hover:bg-slate-50">U</button>
+                        <div className="h-6 w-px bg-slate-200" />
+
+                        <select value={announcementFont} onChange={(e) => { setAnnouncementFont(e.target.value); applyAnnouncementFormat('fontName', e.target.value); }} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-medium text-slate-700">
+                          <option value="serif">Serif</option>
+                          <option value="sans-serif">Sans-serif</option>
+                          <option value="monospace">Monospace</option>
+                          <option value="Georgia">Georgia</option>
+                          <option value="Verdana">Verdana</option>
+                          <option value="Comic Sans MS">Comic Sans</option>
+                        </select>
+
+                        <div className="h-6 w-px bg-slate-200" />
+
+                        <button type="button" onClick={() => applyAnnouncementFormat('justifyLeft')} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" title="Aligner a gauche">L</button>
+                        <button type="button" onClick={() => applyAnnouncementFormat('justifyCenter')} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" title="Centrer">C</button>
+                        <button type="button" onClick={() => applyAnnouncementFormat('justifyRight')} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" title="Aligner a droite">R</button>
+                        <button type="button" onClick={() => applyAnnouncementFormat('justifyFull')} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" title="Justifier">J</button>
+
+                        <div className="h-6 w-px bg-slate-200" />
+
+                        <button type="button" onClick={() => applyAnnouncementFormat('insertUnorderedList')} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" title="Liste a puces">-</button>
+                        <button type="button" onClick={() => applyAnnouncementFormat('insertOrderedList')} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" title="Liste numerotee">1.</button>
+
+                        <div className="h-6 w-px bg-slate-200" />
+
+                        <label className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm text-slate-700 hover:bg-slate-50">
+                          <span className="text-xs font-medium">A</span>
+                          <input type="color" value={announcementColor} onChange={(e) => setAnnouncementColor(e.target.value)} className="h-6 w-8 cursor-pointer rounded border-0 p-0" />
+                        </label>
+                        <button type="button" onClick={() => wrapSelectionWithSpan(`color: ${announcementColor};`)} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50">Couleur</button>
+
+                        <label className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm text-slate-700 hover:bg-slate-50">
+                          <span className="text-xs font-medium">Bg</span>
+                          <input type="color" value={announcementBgColor} onChange={(e) => setAnnouncementBgColor(e.target.value)} className="h-6 w-8 cursor-pointer rounded border-0 p-0" />
+                        </label>
+                        <button type="button" onClick={() => wrapSelectionWithSpan(`background-color: ${announcementBgColor};`)} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50">Fond</button>
+
+                        <div className="h-6 w-px bg-slate-200" />
+
+                        <select value={announcementSize} onChange={(e) => setAnnouncementSize(e.target.value)} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-medium text-slate-700">
+                          {['14','16','18','20','22','24','28','32','36'].map((size) => (
+                            <option key={size} value={size}>{size}px</option>
+                          ))}
+                        </select>
+                        <button type="button" onClick={() => wrapSelectionWithSpan(`font-size: ${announcementSize}px;`)} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50">Taille</button>
+                      </div>
+
+                      <div
+                        ref={announcementEditorRef}
+                        contentEditable
+                        suppressContentEditableWarning
+                        onInput={updateAnnouncementHtml}
+                        className={`${inputCls} min-h-[220px] overflow-auto rounded-2xl border border-slate-200 bg-white p-3 whitespace-pre-wrap break-words focus:outline-none focus:ring-2 focus:ring-indigo-500`}
+                      />
+                      <p className="mt-2 text-xs text-slate-500">
+                        Ecrivez ou collez votre message ici. Selectionnez du texte pour appliquer la mise en forme.
+                      </p>
+                    </div>
+
+                    <div className="mt-4">
+                      <label className="mb-1 block text-sm font-semibold text-slate-700">Image / GIF (URL ou upload)</label>
+                      <div className="grid gap-2">
+                        <input
+                          type="text"
+                          value={sd.announcementImage}
+                          onChange={(e) => setSD({ announcementImage: e.target.value })}
+                          className={inputCls}
+                          placeholder="https://..."
+                        />
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => announcementImageFileRef.current?.click()}
+                            className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white"
+                          >
+                            Telecharger une image
+                          </button>
+                          {sd.announcementImage && (
+                            <button
+                              type="button"
+                              onClick={() => setSD({ announcementImage: '' })}
+                              className="rounded-xl bg-gray-100 px-4 py-2 text-sm font-semibold text-gray-700"
+                            >
+                              Retirer l'image
+                            </button>
+                          )}
+                        </div>
+                        <input
+                          ref={announcementImageFileRef}
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (!f) return;
+                            const reader = new FileReader();
+                            reader.onloadend = () => setSD({ announcementImage: reader.result as string });
+                            reader.readAsDataURL(f);
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-slate-900">Boutons de reaction</p>
+                          <p className="text-xs text-slate-500">Ajoutez des boutons sur lesquels les clients peuvent reagir.</p>
+                        </div>
+                        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+                          {sd.announcementReactionButtons.length}/6
+                        </span>
+                      </div>
+
+                      <div className="mt-3 grid gap-2 md:grid-cols-[90px,1fr,auto]">
+                        <input
+                          type="text"
+                          value={announcementReactionEmoji}
+                          onChange={(e) => setAnnouncementReactionEmoji(e.target.value)}
+                          className={inputCls}
+                          placeholder="🔥"
+                          maxLength={4}
+                        />
+                        <input
+                          type="text"
+                          value={announcementReactionLabel}
+                          onChange={(e) => setAnnouncementReactionLabel(e.target.value)}
+                          className={inputCls}
+                          placeholder="Ex: J'aime, Promo, Je viens"
+                          maxLength={24}
+                        />
+                        <button
+                          type="button"
+                          onClick={handleAddReactionButton}
+                          className="rounded-xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white"
+                        >
+                          Ajouter
+                        </button>
+                      </div>
+
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {sd.announcementReactionButtons.length > 0 ? (
+                          sd.announcementReactionButtons.map((button) => (
+                            <div key={button.id} className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                              <span>{button.emoji || '💬'}</span>
+                              <span className="font-medium">{button.label}</span>
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveReactionButton(button.id)}
+                                className="rounded-full bg-white px-2 py-0.5 text-xs font-semibold text-rose-600 hover:bg-rose-50"
+                              >
+                                Retirer
+                              </button>
+                            </div>
+                          ))
+                        ) : (
+                          <p className="text-sm text-slate-500">Aucun bouton ajoute pour le moment.</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 via-white to-sky-50 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">Visualisation</p>
+                        <p className="text-xs text-slate-500">Simulation de l'emplacement sur l'espace client.</p>
+                      </div>
+                      <span className={`rounded-full px-3 py-1 text-xs font-semibold ${liveIsVisible ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}>
+                        {liveIsVisible ? 'Publication live' : 'Pas encore diffuse'}
+                      </span>
+                    </div>
+
+                    <div className="mt-4 rounded-[28px] border border-white/80 bg-white/90 p-5 shadow-sm">
+                      <p className="text-xs font-semibold uppercase tracking-[0.24em] text-indigo-500">Simulation client</p>
+                      <h4 className="mt-2 text-lg font-bold text-indigo-900">Bienvenue Client !</h4>
+                      <p className="text-sm text-indigo-600">
+                        {draftHasContent
+                          ? "Voici le bloc qui apparaitra sous le message de bienvenue."
+                          : "Ajoutez un texte, une image ou des boutons pour preparer la publication."}
+                      </p>
+
+                      {draftHasContent ? (
+                        <div className="mt-4 rounded-3xl border border-indigo-100 bg-gradient-to-b from-white to-indigo-50/70 p-4 shadow-sm">
+                          {!sd.announcementEnabled && (
+                            <div className="mb-3 inline-flex rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800">
+                              Diffusion desactivee - le client ne voit pas encore ce contenu
+                            </div>
+                          )}
+                          {sd.announcementText && (
+                            <div
+                              className="mb-3 whitespace-pre-wrap break-words text-sm text-slate-800"
+                              dangerouslySetInnerHTML={{ __html: sd.announcementText }}
+                            />
+                          )}
+                          {sd.announcementImage && (
+                            <div className="overflow-hidden rounded-3xl border border-indigo-100 bg-white">
+                              <img src={sd.announcementImage} alt="Apercu publication" className="max-h-72 w-full object-cover" />
+                            </div>
+                          )}
+                          {sd.announcementReactionButtons.length > 0 && (
+                            <div className="mt-4 flex flex-wrap gap-2">
+                              {sd.announcementReactionButtons.map((button) => (
+                                <div key={button.id} className="inline-flex items-center gap-2 rounded-full border border-indigo-100 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm">
+                                  <span>{button.emoji || '💬'}</span>
+                                  <span>{button.label}</span>
+                                  <span className="rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-semibold text-indigo-700">
+                                    {liveReactionCounts[button.id] || 0}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="mt-4 rounded-3xl border border-dashed border-slate-300 bg-white/80 p-8 text-center text-sm text-slate-500">
+                          Le contenu de l'editeur s'affichera ici en temps reel.
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="mt-4 rounded-3xl border border-indigo-100 bg-white/90 p-4 shadow-sm">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-slate-900">Reactions en direct</p>
+                          <p className="text-xs text-slate-500">Suivi des clics clients sur la publication actuellement diffusee.</p>
+                        </div>
+                        <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
+                          {restaurantSettings.announcementReactionsTotal} total
+                        </span>
+                      </div>
+
+                      {liveReactionButtons.length > 0 ? (
+                        <div className="mt-3 space-y-2">
+                          {liveReactionButtons.map((button) => (
+                            <div key={button.id} className="flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                              <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                                <span>{button.emoji || '💬'}</span>
+                                <span>{button.label}</span>
+                              </div>
+                              <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-700 shadow-sm">
+                                {liveReactionCounts[button.id] || 0} reaction{(liveReactionCounts[button.id] || 0) > 1 ? 's' : ''}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="mt-3 text-sm text-slate-500">Ajoutez des boutons de reaction pour permettre aux clients de repondre.</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+                  <p className={`text-sm ${textSec}`}>
+                    Astuce : enregistrez apres chaque modification importante pour mettre a jour les clients deja connectes.
+                  </p>
+                  <div className="flex flex-wrap gap-3">
+                    {isDirty && (
+                      <button
+                        onClick={() => setSettingsDraft(null)}
+                        className={`rounded-xl px-6 py-3 text-sm font-bold transition-colors ${darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'}`}
+                      >
+                        Annuler les modifications
+                      </button>
+                    )}
+                    <button
+                      onClick={isDirty ? handleSaveSettings : openSettingsDraft}
+                      disabled={savingSettings}
+                      className={`flex items-center gap-2 rounded-xl px-6 py-3 text-sm font-bold text-white shadow-sm transition-colors disabled:opacity-60 ${
+                        isDirty ? 'bg-green-600 hover:bg-green-700' : 'bg-indigo-600 hover:bg-indigo-700'
+                      }`}
+                    >
+                      {savingSettings
+                        ? <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                        : <Save size={16} />}
+                      {isDirty ? 'Enregistrer la publication' : 'Preparer une publication'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         {/* ========== SETTINGS TAB ========== */}
-        {activeTab === 'settings' && (
-          <div className="space-y-4">
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className={`${cardBg} border rounded-2xl p-5 shadow-sm`}>
-              <h3 className="text-lg font-bold mb-4">🏪 Restaurant</h3>
-              <div className="space-y-4">
-                <div>
-                  <label className={`text-sm font-semibold ${textSec} block mb-1`}>Nom du restaurant</label>
-                  <input type="text" value={restaurantSettings.name} onChange={e => updateRestaurantSettings({ name: e.target.value })} className={inputCls} />
+        {activeTab === 'settings' && (() => {
+          // Draft local : on édite settingsDraft, on enregistre en une fois
+          const sd = settingsDraft ?? restaurantSettings;
+          const isDirty = settingsDraft !== null;
+          const setSD = (patch: Partial<typeof restaurantSettings>) =>
+            setSettingsDraft(prev => ({ ...(prev ?? restaurantSettings), ...patch }));
+
+          return (
+            <div className="space-y-4">
+              {/* Barre d'action flottante quand il y a des modifications */}
+              {isDirty && (
+                <div className="sticky top-0 z-10 flex items-center justify-between gap-3 bg-indigo-600 text-white rounded-2xl px-5 py-3 shadow-lg">
+                  <p className="text-sm font-semibold">⚠️ Modifications non enregistrées</p>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setSettingsDraft(null)}
+                      className="px-4 py-2 bg-white/20 hover:bg-white/30 rounded-xl text-sm font-bold transition-colors"
+                    >
+                      Annuler
+                    </button>
+                    <button
+                      onClick={handleSaveSettings}
+                      disabled={savingSettings}
+                      className="flex items-center gap-2 px-4 py-2 bg-white text-indigo-700 hover:bg-indigo-50 rounded-xl text-sm font-bold disabled:opacity-60 transition-colors shadow-sm"
+                    >
+                      {savingSettings
+                        ? <span className="animate-spin w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full" />
+                        : <Save size={15} />}
+                      Enregistrer
+                    </button>
+                  </div>
                 </div>
-                <div>
-                  <label className={`text-sm font-semibold ${textSec} block mb-1`}>Nombre de tables</label>
-                  <input type="number" value={restaurantSettings.tableCount} onChange={e => updateRestaurantSettings({ tableCount: parseInt(e.target.value) || 20 })} className={inputCls} />
+              )}
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {/* Infos restaurant */}
+                <div className={`${cardBg} border rounded-2xl p-5 shadow-sm`}>
+                  <h3 className="text-lg font-bold mb-4">🏪 Restaurant</h3>
+                  <div className="space-y-4">
+                    <div>
+                      <label className={`text-sm font-semibold ${textSec} block mb-1`}>Nom du restaurant</label>
+                      <input type="text" value={sd.name} onChange={e => setSD({ name: e.target.value })} className={inputCls} />
+                    </div>
+                    <div>
+                      <label className={`text-sm font-semibold ${textSec} block mb-1`}>Nombre de tables</label>
+                      <input type="number" value={sd.tableCount} onChange={e => setSD({ tableCount: parseInt(e.target.value) || 20 })} className={inputCls} />
+                    </div>
+                    <div>
+                      <label className={`text-sm font-semibold ${textSec} block mb-1`}>Téléphone</label>
+                      <input type="text" value={sd.phone ?? ''} onChange={e => setSD({ phone: e.target.value })} className={inputCls} />
+                    </div>
+                    <div>
+                      <label className={`text-sm font-semibold ${textSec} block mb-1`}>Adresse</label>
+                      <input type="text" value={sd.address ?? ''} onChange={e => setSD({ address: e.target.value })} className={inputCls} />
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <label className={`text-sm font-semibold ${textSec} block mb-1`}>Téléphone</label>
-                  <input type="text" value={restaurantSettings.phone} onChange={e => updateRestaurantSettings({ phone: e.target.value })} className={inputCls} />
-                </div>
-                <div>
-                  <label className={`text-sm font-semibold ${textSec} block mb-1`}>Adresse</label>
-                  <input type="text" value={restaurantSettings.address} onChange={e => updateRestaurantSettings({ address: e.target.value })} className={inputCls} />
+
+                {/* TVA & Prix */}
+                <div className={`${cardBg} border rounded-2xl p-5 shadow-sm`}>
+                  <h3 className="text-lg font-bold mb-4">💰 TVA & Prix</h3>
+                  <div className="space-y-4">
+                    <div>
+                      <label className={`text-sm font-semibold ${textSec} block mb-1`}>Taux TVA (%)</label>
+                      <input type="number" value={sd.vatRate} onChange={e => setSD({ vatRate: parseFloat(e.target.value) || 0 })} className={inputCls} />
+                    </div>
+                    <div>
+                      <label className={`text-sm font-semibold ${textSec} block mb-1`}>Temps de préparation par défaut (min)</label>
+                      <input type="number" value={sd.defaultPrepTime} onChange={e => setSD({ defaultPrepTime: parseInt(e.target.value) || 20 })} className={inputCls} />
+                    </div>
+                    <div>
+                      <label className={`text-sm font-semibold ${textSec} block mb-1`}>Devise</label>
+                      <input type="text" value={sd.currency} onChange={e => setSD({ currency: e.target.value })} className={inputCls} />
+                    </div>
+                  </div>
                 </div>
               </div>
-            </div>
 
-            <div className={`${cardBg} border rounded-2xl p-5 shadow-sm`}>
-              <h3 className="text-lg font-bold mb-4">💰 TVA & Prix</h3>
-              <div className="space-y-4">
-                <div>
-                  <label className={`text-sm font-semibold ${textSec} block mb-1`}>Taux TVA (%)</label>
-                  <input type="number" value={restaurantSettings.vatRate} onChange={e => updateRestaurantSettings({ vatRate: parseFloat(e.target.value) || 0 })} className={inputCls} />
-                </div>
-                <div>
-                  <label className={`text-sm font-semibold ${textSec} block mb-1`}>Temps de préparation par défaut (min)</label>
-                  <input type="number" value={restaurantSettings.defaultPrepTime} onChange={e => updateRestaurantSettings({ defaultPrepTime: parseInt(e.target.value) || 20 })} className={inputCls} />
-                </div>
-                <div>
-                  <label className={`text-sm font-semibold ${textSec} block mb-1`}>Devise</label>
-                  <input type="text" value={restaurantSettings.currency} onChange={e => updateRestaurantSettings({ currency: e.target.value })} className={inputCls} />
+              {/* Logo */}
+              <div className={`${cardBg} border rounded-2xl p-5 shadow-sm`}>
+                <h3 className="text-lg font-bold mb-4">🖼️ Logo</h3>
+                <div className="flex items-center gap-4">
+                  {sd.logo
+                    ? <img src={sd.logo} alt="Logo" className="w-20 h-20 rounded-2xl object-cover shadow-sm" />
+                    : <div className="w-20 h-20 rounded-2xl bg-gray-200 flex items-center justify-center text-3xl">🏪</div>}
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex items-center gap-2 px-4 py-3 bg-indigo-600 text-white rounded-xl text-sm font-bold shadow-sm"
+                  >
+                    <Upload size={16} /> {sd.logo ? 'Changer' : 'Uploader'}
+                  </button>
+                  <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={e => {
+                    const f = e.target.files?.[0]; if (!f) return;
+                    const r = new FileReader();
+                    r.onloadend = () => setSD({ logo: r.result as string });
+                    r.readAsDataURL(f);
+                  }} />
                 </div>
               </div>
-            </div>
-            </div>
 
-            <div className={`${cardBg} border rounded-2xl p-5 shadow-sm`}>
-              <h3 className="text-lg font-bold mb-4">🖼️ Logo</h3>
-              <div className="flex items-center gap-4">
-                {restaurantSettings.logo ? <img src={restaurantSettings.logo} alt="Logo" className="w-20 h-20 rounded-2xl object-cover shadow-sm" /> :
-                  <div className="w-20 h-20 rounded-2xl bg-gray-200 flex items-center justify-center text-3xl">🏪</div>}
-                <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-4 py-3 bg-indigo-600 text-white rounded-xl text-sm font-bold shadow-sm">
-                  <Upload size={16} /> {restaurantSettings.logo ? 'Changer' : 'Uploader'}
+              <div className={`${cardBg} border rounded-2xl p-5 shadow-sm`}>
+                <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                  <div>
+                    <h3 className="text-lg font-bold">Publication client</h3>
+                    <p className={`mt-1 text-sm ${textSec}`}>
+                      La creation, la diffusion et la suppression de la publication se gerent maintenant dans l'onglet Publication.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('publication')}
+                    className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-3 text-sm font-bold text-white shadow-sm transition-colors hover:bg-indigo-700"
+                  >
+                    <Bell size={16} /> Ouvrir l'onglet publication
+                  </button>
+                </div>
+              </div>
+
+              {/* Bouton d'enregistrement principal (en bas) */}
+              <div className="flex justify-end gap-3">
+                {isDirty && (
+                  <button
+                    onClick={() => setSettingsDraft(null)}
+                    className={`px-6 py-3 rounded-xl text-sm font-bold ${darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-100 hover:bg-gray-200'} transition-colors`}
+                  >
+                    Annuler les modifications
+                  </button>
+                )}
+                <button
+                  onClick={isDirty ? handleSaveSettings : openSettingsDraft}
+                  disabled={savingSettings}
+                  className={`flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-bold disabled:opacity-60 shadow-sm transition-colors ${
+                    isDirty
+                      ? 'bg-green-600 hover:bg-green-700 text-white'
+                      : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                  }`}
+                >
+                  {savingSettings
+                    ? <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
+                    : <Save size={16} />}
+                  {isDirty ? 'Enregistrer les paramètres' : 'Modifier les paramètres'}
                 </button>
-                <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={e => {
-                  const f = e.target.files?.[0]; if (!f) return;
-                  const r = new FileReader(); r.onloadend = () => updateRestaurantSettings({ logo: r.result as string }); r.readAsDataURL(f);
-                }} />
               </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
       </div>
 
       {/* ========== MODALS ========== */}

@@ -6,12 +6,13 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "4000:4000"
+      - "4000:4000"        # optionnel en prod, nginx proxy suffit
     volumes:
       - sqlite-data:/app/data
     environment:
       - PORT=4000
       - SQLITE_PATH=/app/data/app.db
+      # Accepte uniquement l'origine du frontend (remplacer par votre domaine en prod)
       - CORS_ORIGIN=*
     restart: unless-stopped
     healthcheck:
@@ -25,11 +26,13 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
     ports:
-      - "5173:80"
+      - "80:80"            # Port 80 standard (était 5173:80)
     depends_on:
       backend:
         condition: service_healthy
     restart: unless-stopped
+    # Pas de VITE_API_URL ici : le frontend utilise des URLs relatives (/api/...)
+    # Nginx dans ce container proxie /api/ vers http://backend:4000
 
 volumes:
   sqlite-data:

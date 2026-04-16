@@ -55,7 +55,7 @@ export interface DbOrder {
   }>
   total: number
   status: 'pending' | 'confirmed' | 'preparing' | 'ready' | 'completed' | 'cancelled'
-  payment_method: string | null
+  payment_method: 'orange' | 'mvola' | 'airtel'
   payment_status: 'pending' | 'paid' | 'failed'
   created_at: string
   updated_at: string

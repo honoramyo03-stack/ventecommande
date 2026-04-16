@@ -157,9 +157,10 @@ export const CustomerProvider: React.FC<{ children: ReactNode }> = ({ children }
   }, [loadConnectedCustomers]);
 
   const login = useCallback(async (name: string, tableNumber: number) => {
-    await reserveTable(name, tableNumber);
+    const normalizedName = name.trim();
+    await reserveTable(normalizedName, tableNumber);
     const session: CustomerSession = {
-      name,
+      name: normalizedName,
       tableNumber,
       connectedAt: new Date().toISOString(),
     };
