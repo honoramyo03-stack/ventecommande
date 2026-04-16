@@ -105,7 +105,25 @@ CREATE TABLE IF NOT EXISTS restaurant_settings (
   currency TEXT NOT NULL,
   phone TEXT,
   address TEXT,
+  announcement_enabled INTEGER NOT NULL DEFAULT 0,
+  announcement_text TEXT,
+  announcement_image TEXT,
+  announcement_published_at TEXT,
+  announcement_revision TEXT,
+  announcement_reaction_buttons TEXT,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS announcement_reactions (
+  id TEXT PRIMARY KEY,
+  announcement_revision TEXT NOT NULL,
+  button_id TEXT NOT NULL,
+  customer_key TEXT NOT NULL,
+  customer_name TEXT NOT NULL,
+  table_number INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(announcement_revision, customer_key)
 );
 
 CREATE TABLE IF NOT EXISTS payment_transactions (
@@ -125,6 +143,8 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_messages_recipient_table ON messages(recipient_table);
 CREATE INDEX IF NOT EXISTS idx_connected_clients_table_number ON connected_clients(table_number);
+CREATE INDEX IF NOT EXISTS idx_announcement_reactions_revision ON announcement_reactions(announcement_revision);
+CREATE INDEX IF NOT EXISTS idx_announcement_reactions_button ON announcement_reactions(announcement_revision, button_id);
 `);
 
 const productsCount = db.prepare('SELECT COUNT(*) AS count FROM products').get().count;
@@ -161,8 +181,8 @@ if (!categoriesCount) {
 
 if (!settingsCount) {
   db.prepare(
-    'INSERT INTO restaurant_settings (id, name, table_count, logo, vat_rate, default_prep_time, currency, phone, address, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run('QuickOrder', 20, '', 20, 20, 'Ar', '', '', nowIso());
+    'INSERT INTO restaurant_settings (id, name, table_count, logo, vat_rate, default_prep_time, currency, phone, address, announcement_enabled, announcement_text, announcement_image, announcement_published_at, announcement_revision, announcement_reaction_buttons, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run('QuickOrder', 20, '', 20, 20, 'Ar', '', '', 0, '', '', null, randomUUID(), '[]', nowIso());
   console.log('✅ Paramètres restaurant initialisés');
 }
 
